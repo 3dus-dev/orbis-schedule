@@ -1,0 +1,13 @@
+{
+  "name": "orbis-schedule",
+  "version": "1.0.0",
+  "description": "Orbis Design Group — branded scheduling backend (Google Calendar + qualification).",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "googleapis": "^144.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
