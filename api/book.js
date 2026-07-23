@@ -2,11 +2,16 @@
    POST /api/book
    -------------------------------------------------------------------
    Body: { start, name, email, phone, company, role, referral,
-           projectType, size, location, services[], timeline, notes }
+           projectType, region, size, location, services[], timeline, notes }
 
    Qualified lead   → confirmed event + Google Meet + invite to client.
    Unqualified lead → tentative "⚠ REVIEW" hold on the calendar, no
                       invite sent; client is told the request is pending.
+
+   In BOTH cases an internal notification email is sent to NOTIFY_EMAIL
+   (your team) with the full lead details AND the qualification result.
+   The qualification is NEVER written into the calendar event, so a
+   confirmed client who receives the invite never sees the scoring.
 
    Response:
      { status:'confirmed', meetLink, start, end }
@@ -16,13 +21,19 @@
 import { getCalendar, CALENDAR_ID, cors } from '../lib/google.js';
 import { validateSlot, CONFIG } from '../lib/slots.js';
 import { qualify, QUALIFY_META } from '../lib/qualify.js';
+import { sendMail } from '../lib/mail.js';
 
 const esc = (s) => String(s == null ? '' : s).trim();
 
-function describe(a, q) {
+/* CLIENT-SAFE event description — the lead's own submitted details only.
+   No qualification score / signals / flags: a confirmed lead receives the
+   calendar invite and would otherwise see them. */
+function eventDescription(a, qualified) {
   const line = (label, val) => `${label}: ${val || '—'}`;
   return [
-    q.qualified ? 'ORBIS · CONFIRMED PITCH MEETING' : '⚠ ORBIS · PENDING REVIEW — do not treat as confirmed',
+    qualified
+      ? 'ORBIS · CONFIRMED PITCH MEETING'
+      : '⚠ ORBIS · PENDING REVIEW — do not treat as confirmed',
     '',
     line('Name', esc(a.name)),
     line('Email', esc(a.email)),
@@ -39,12 +50,39 @@ function describe(a, q) {
     line('Timeline', esc(a.timeline)),
     '',
     line('Notes', esc(a.notes)),
-    '',
-    '— qualification ————————————',
-    `score: ${q.score} (threshold ${QUALIFY_META.THRESHOLD})`,
-    `signals: ${q.reasons.join('; ') || 'none'}`,
-    `flags: ${q.flags.join('; ') || 'none'}`,
   ].join('\n');
+}
+
+/* INTERNAL email body — everything above PLUS the qualification. Goes to
+   your team only (NOTIFY_EMAIL), never to the client. */
+function internalEmailText(a, q, when, qualified, meetLink, eventLink) {
+  return [
+    qualified
+      ? 'AUTO-CONFIRMED — the client has been sent a calendar invite + Google Meet link.'
+      : 'HELD FOR REVIEW — no invite was sent to the client. Open the event and add them to confirm.',
+    '',
+    `When:  ${when}`,
+    meetLink ? `Meet:  ${meetLink}` : null,
+    eventLink ? `Event: ${eventLink}` : null,
+    '',
+    '— lead —————————————————————',
+    eventDescription(a, qualified),
+    '',
+    '— qualification —————————————',
+    `decision: ${q.qualified ? 'QUALIFIED' : 'NOT qualified'}`,
+    `score:    ${q.score} (threshold ${QUALIFY_META.THRESHOLD})`,
+    `signals:  ${q.reasons.join('; ') || 'none'}`,
+    `flags:    ${q.flags.join('; ') || 'none'}`,
+  ].filter((l) => l !== null).join('\n');
+}
+
+/* Human-readable meeting time in the studio's timezone. */
+function whenStr(startISO) {
+  return new Intl.DateTimeFormat('en-US', {
+    weekday: 'long', month: 'long', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+    timeZone: CONFIG.TZ, timeZoneName: 'short',
+  }).format(new Date(startISO));
 }
 
 export default async function handler(req, res) {
@@ -83,7 +121,7 @@ export default async function handler(req, res) {
     const who = esc(a.company) ? `${esc(a.name)} · ${esc(a.company)}` : esc(a.name);
     const requestBody = {
       summary: q.qualified ? `Pitch — ${who}` : `⚠ REVIEW — ${who}`,
-      description: describe(a, q),
+      description: eventDescription(a, q.qualified), // client-safe — no qualification
       status: q.qualified ? 'confirmed' : 'tentative',
       start: { dateTime: a.start, timeZone: CONFIG.TZ },
       end: { dateTime: v.end, timeZone: CONFIG.TZ },
@@ -114,6 +152,26 @@ export default async function handler(req, res) {
       event.data.hangoutLink ||
       event.data.conferenceData?.entryPoints?.find((e) => e.entryPointType === 'video')?.uri ||
       null;
+    const eventLink = event.data.htmlLink || null;
+
+    // --- Notify the team internally (full details + qualification) ---
+    // Never blocks or fails the booking; the client already has their result.
+    const notifyTo = process.env.NOTIFY_EMAIL;
+    if (notifyTo) {
+      try {
+        const when = whenStr(a.start);
+        await sendMail({
+          to: notifyTo,
+          from: process.env.NOTIFY_FROM || notifyTo,
+          subject: `${q.qualified ? 'New booking' : '⚠ REVIEW'} — ${who} — ${when}`,
+          text: internalEmailText(a, q, when, q.qualified, meetLink, eventLink),
+        });
+      } catch (mailErr) {
+        console.error('[book] internal notification email failed:', mailErr?.response?.data || mailErr);
+      }
+    } else {
+      console.warn('[book] NOTIFY_EMAIL not set — skipping internal notification email');
+    }
 
     return res.status(200).json({
       status: q.qualified ? 'confirmed' : 'pending',
