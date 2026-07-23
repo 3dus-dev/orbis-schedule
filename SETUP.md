@@ -3,7 +3,9 @@
 A branded "qualify, then book" page for **orbisdesign.group**. Clients answer a short
 questionnaire, then pick a 30-minute slot that is read **live from your Google Calendar**.
 Qualified leads are confirmed instantly with a Google Meet link + invite; everyone else is
-held as a tentative **⚠ REVIEW** event for you to approve.
+held as a tentative **⚠ REVIEW** event for you to approve. On every booking your team also gets
+an **internal email** with the full lead details and the qualification result — that scoring is
+kept out of the calendar event, so a confirmed client never sees it.
 
 You'll do three things: (1) give the backend permission to use your Google Calendar,
 (2) deploy the backend to Vercel, (3) paste the page into Webflow. Budget ~30 minutes.
@@ -19,8 +21,9 @@ orbis-schedule/
 │  └─ book.js           → POST /api/book          (qualify + create the event)
 ├─ lib/
 │  ├─ slots.js          → the availability math (hours, buffer, window)
-│  ├─ google.js         → Google Calendar auth + CORS
-│  └─ qualify.js        → the lead qualification rules  ← tune this
+│  ├─ google.js         → Google Calendar + Gmail auth + CORS
+│  ├─ qualify.js        → the lead qualification rules  ← tune this
+│  └─ mail.js           → sends the internal booking email (Gmail)
 ├─ package.json
 └─ vercel.json
 ```
@@ -42,7 +45,8 @@ client an invite, and it works even though your org blocks downloadable service-
 (`iam.disableServiceAccountKeyCreation`). No key file is ever created.
 
 1. Go to **console.cloud.google.com** → create a project (e.g. `orbis-schedule`) or reuse one.
-2. **APIs & Services → Library** → search **Google Calendar API** → **Enable**.
+2. **APIs & Services → Library** → enable **two** APIs: search **Google Calendar API** → **Enable**,
+   then search **Gmail API** → **Enable**. (Gmail is what sends your team the internal booking email.)
 3. **APIs & Services → OAuth consent screen** → **User type: Internal** (this keeps it to your
    3dus.us org and makes the refresh token long-lived) → fill app name (`Orbis Scheduler`) and your
    support email → **Save**.
@@ -57,8 +61,11 @@ client an invite, and it works even though your org blocks downloadable service-
 1. Open **https://developers.google.com/oauthplayground**.
 2. Click the **gear icon** (top right) → check **"Use your own OAuth credentials"** → paste the
    **Client ID** and **Client secret** from Step 1.4.
-3. On the left, in **"Input your own scopes"**, paste:
-   `https://www.googleapis.com/auth/calendar` → click **Authorize APIs**.
+3. On the left, in **"Input your own scopes"**, paste **both** scopes (space-separated):
+   `https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/gmail.send`
+   → click **Authorize APIs**. *(Both matter: `calendar` creates the events, `gmail.send` sends
+   your team the booking email. If you already issued a calendar-only token, you must re-run this
+   step with both scopes and replace the token — a token can't gain a scope after the fact.)*
 4. Sign in **as juan@3dus.us** and allow access. (If it warns the app is unverified, it's your own
    internal app — continue.)
 5. Back on the Playground, click **"Exchange authorization code for tokens."** Copy the
@@ -76,7 +83,7 @@ Same flow as your intake backend (web UI, no terminal).
    file"**. Upload the whole folder so the structure is exactly `api/`, `lib/`, `package.json`,
    `vercel.json`. Commit. *(The `lib/` folder must be included — the functions import from it.)*
 2. **vercel.com → Add New → Project → Import** the `orbis-schedule` repo.
-3. Before deploying, expand **Environment Variables** and add these five:
+3. Before deploying, expand **Environment Variables** and add these six:
 
    | Key | Value |
    |-----|-------|
@@ -85,6 +92,11 @@ Same flow as your intake backend (web UI, no terminal).
    | `GOOGLE_OAUTH_REFRESH_TOKEN` | the refresh token from Step 2.5 |
    | `CALENDAR_ID` | `primary` (or a specific calendar's ID) |
    | `ALLOWED_ORIGIN` | `https://www.orbisdesign.group` (your published domain) |
+   | `NOTIFY_EMAIL` | where the internal booking email lands, e.g. `juan@3dus.us` (a team alias works too) |
+
+   *(Optional: `NOTIFY_FROM` sets the From address; if omitted it defaults to `NOTIFY_EMAIL`, and
+   Gmail sends as the authenticated account either way. If `NOTIFY_EMAIL` is left unset, bookings
+   still work — the internal email is simply skipped.)*
 
 4. **Deploy.** Note the domain, e.g. `https://orbis-schedule.vercel.app`.
 5. If you added the env vars after the first deploy: **Deployments → newest → ⋯ → Redeploy**
@@ -131,10 +143,14 @@ correct.
 - **Qualified** → event created as **confirmed**, Google Meet link attached, client added as an
   attendee and emailed the invite. Client sees "You're on the calendar."
 - **Not qualified** → event created as **tentative**, titled `⚠ REVIEW — …`, colored orange, with
-  the full questionnaire + the qualification reasons in the description. **No invite is sent to the
-  client.** The client sees "Request received — we review every inquiry personally." You approve by
-  opening the event, adding the client, and confirming (or delete it to free the slot). The held
-  slot blocks that time so it isn't double-booked while you decide.
+  the client's submitted details in the description. **No invite is sent to the client.** The client
+  sees "Request received — we review every inquiry personally." You approve by opening the event,
+  adding the client, and confirming (or delete it to free the slot). The held slot blocks that time
+  so it isn't double-booked while you decide.
+- **Every booking (both cases)** → an internal email goes to `NOTIFY_EMAIL` with the meeting time,
+  the Meet + event links, all the lead's answers, and the **qualification** (decision, score,
+  signals, flags). The qualification lives **only** in this email — it is never written into the
+  calendar event, so a confirmed client who opens the invite never sees the scoring.
 
 ## Troubleshooting
 
@@ -145,8 +161,13 @@ correct.
 - **Refresh token stopped working after ~7 days** → the OAuth consent screen was left as "Testing"
   instead of **Internal**. Set it to **Internal** (Step 1.3), then re-issue the token (Step 2).
   Internal-app refresh tokens don't expire.
-- **Booking works but no Meet link / client gets no invite** → confirm the scope granted in Step 2.3
-  was exactly `https://www.googleapis.com/auth/calendar` (not a read-only scope). Re-issue if needed.
+- **Booking works but no Meet link / client gets no invite** → confirm the granted scope in Step 2.3
+  included `https://www.googleapis.com/auth/calendar` (not a read-only scope). Re-issue if needed.
+- **Booking works but no internal email arrives** → three things to check: (1) `NOTIFY_EMAIL` is set
+  in Vercel and you redeployed; (2) the **Gmail API** is enabled (Step 1.2); (3) the refresh token
+  was issued with the `gmail.send` scope (Step 2.3) — a calendar-only token won't send mail, so
+  re-issue it with **both** scopes and update `GOOGLE_OAUTH_REFRESH_TOKEN`. Check the function logs
+  in Vercel for `internal notification email failed` — the booking itself still succeeds regardless.
 - **Times look wrong** → the calendar runs on `America/New_York` (Eastern, DST handled
   automatically) in `lib/slots.js`. If you relocate, change `TZ` there (and `CONFIG.TZ` /
   `TZ_ABBR` / `TZ_LABEL` in `schedule-embed.html`).
